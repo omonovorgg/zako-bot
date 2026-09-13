@@ -38,6 +38,7 @@ WEBHOOK_URL = PUBLIC_URL + WEBHOOK_PATH
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 db_pool = None
+app = FastAPI()
 
 
 # ============================================================
