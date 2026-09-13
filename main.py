@@ -34,6 +34,13 @@ if not DATABASE_URL:
 
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_URL = PUBLIC_URL + WEBHOOK_PATH
+WEBHOOK_SECRET = hmac.new(
+    b"ZAKO_WEBHOOK_SECRET",
+    BOT_TOKEN.encode("utf-8"),
+    hashlib.sha256,
+).hexdigest()[:64]
+
+MAX_INIT_DATA_AGE = 24 * 60 * 60
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -148,6 +155,15 @@ def validate_telegram_init_data(init_data: str):
         if not received_hash:
             return None
 
+        auth_date_raw = parsed.get("auth_date", [None])[0]
+        if not auth_date_raw:
+            return None
+
+        auth_date = int(auth_date_raw)
+        now = int(datetime.now(timezone.utc).timestamp())
+        if auth_date > now + 60 or now - auth_date > MAX_INIT_DATA_AGE:
+            return None
+
         data_check_items = []
 
         for key in sorted(parsed):
@@ -204,11 +220,12 @@ def telegram_user_from_request(request: Request, body: dict | None = None):
 # ============================================================
 
 def create_test_token(user_id: int, question_ids: list[int]):
+    nonce = secrets.token_hex(16)
     payload = {
         "uid": user_id,
         "q": question_ids,
         "exp": int(datetime.now(timezone.utc).timestamp()) + 30 * 60,
-        "nonce": secrets.token_hex(8),
+        "nonce": nonce,
     }
 
     encoded = json.dumps(
@@ -224,7 +241,8 @@ def create_test_token(user_id: int, question_ids: list[int]):
         hashlib.sha256,
     ).hexdigest()
 
-    return f"{payload_b64}.{signature}"
+    return f"{payload_b64}.{signature}", nonce
+
 
 
 def verify_test_token(token: str, user_id: int):
@@ -260,7 +278,17 @@ def verify_test_token(token: str, user_id: int):
         if len(question_ids) != len(QUESTIONS):
             return None
 
+        if not all(isinstance(qid, int) and not isinstance(qid, bool) for qid in question_ids):
+            return None
+
+        if len(set(question_ids)) != len(question_ids):
+            return None
+
         if set(question_ids) != set(QUESTION_BY_ID):
+            return None
+
+        nonce = payload.get("nonce")
+        if not isinstance(nonce, str) or len(nonce) < 16:
             return None
 
         return payload
@@ -318,6 +346,20 @@ async def init_db():
         await conn.execute("""
             ALTER TABLE test_results
             ADD COLUMN IF NOT EXISTS total_time_seconds REAL NOT NULL DEFAULT 0
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_attempts (
+                nonce TEXT PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                consumed_at TIMESTAMPTZ
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_test_attempts_user
+            ON test_attempts (telegram_id, expires_at)
         """)
 
         await conn.execute("""
@@ -706,6 +748,10 @@ button:disabled {
     border-color: #b34b4b;
 }
 
+.answer.selected {
+    opacity: 0.75;
+}
+
 
 /* RESULT */
 
@@ -1011,6 +1057,11 @@ button:disabled {
                 <div class="stat-label">TESTLAR</div>
                 <div class="stat-value" id="profileTests">0</div>
             </div>
+
+            <div class="stat">
+                <div class="stat-label">REYTING</div>
+                <div class="stat-value" id="profileRank">—</div>
+            </div>
         </div>
     </div>
 </div>
@@ -1117,10 +1168,14 @@ async function startTest() {
             })
         });
 
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
         const data = await response.json();
 
         if (!data.ok) {
-            alert("Testni boshlashda xato. Telegram ichidan qayta urinib ko'r.");
+            alert(data.error || "Testni boshlashda xato. Telegram ichidan qayta urinib ko'r.");
             return;
         }
 
@@ -1214,7 +1269,7 @@ function chooseAnswer(index, clickedButton) {
     });
 
     if (clickedButton) {
-        clickedButton.classList.add("wrong");
+        clickedButton.classList.add("selected");
     }
 
     setTimeout(() => {
@@ -1253,6 +1308,10 @@ async function finishTest() {
                 answers: answersGiven
             })
         });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
 
         const data = await response.json();
 
@@ -1333,6 +1392,9 @@ async function loadProfile() {
 
         document.getElementById("profileTests").innerText =
             data.tests_taken || 0;
+
+        document.getElementById("profileRank").innerText =
+            data.rank ? `#${data.rank}` : "—";
 
         document.getElementById("homeScore").innerText =
             data.best_score || "—";
@@ -1498,7 +1560,14 @@ async def health():
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    data = await request.json()
+    received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(received_secret, WEBHOOK_SECRET):
+        return {"ok": False, "error": "Unauthorized"}
+
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Invalid JSON"}
 
     update = types.Update.model_validate(
         data,
@@ -1512,7 +1581,10 @@ async def telegram_webhook(request: Request):
 
 @app.post("/api/test/start")
 async def start_test(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Noto'g'ri so'rov."}
 
     user = telegram_user_from_request(request, body)
 
@@ -1530,10 +1602,16 @@ async def start_test(request: Request):
     import random
     random.shuffle(question_ids)
 
-    test_token = create_test_token(
+    test_token, nonce = create_test_token(
         telegram_id,
         question_ids,
     )
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO test_attempts (nonce, telegram_id, expires_at)
+            VALUES ($1, $2, NOW() + INTERVAL '30 minutes')
+        """, nonce, telegram_id)
 
     questions_for_client = [
         {
@@ -1553,7 +1631,10 @@ async def start_test(request: Request):
 
 @app.post("/api/test/submit")
 async def submit_test(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Noto'g'ri so'rov."}
 
     user = telegram_user_from_request(request, body)
 
@@ -1670,53 +1751,56 @@ async def submit_test(request: Request):
     )
 
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (
-                telegram_id,
-                username,
-                first_name
-            )
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                updated_at = NOW()
-        """,
-            telegram_id,
-            user.get("username"),
-            user.get("first_name", ""),
-        )
+        async with conn.transaction():
+            attempt = await conn.fetchrow("""
+                SELECT nonce, expires_at, consumed_at
+                FROM test_attempts
+                WHERE nonce = $1 AND telegram_id = $2
+                FOR UPDATE
+            """, token_data["nonce"], telegram_id)
 
-        await conn.execute("""
-            INSERT INTO test_results (
-                telegram_id,
-                test_type,
-                score,
-                correct_answers,
-                total_questions,
-                total_time_seconds
-            )
-            VALUES ($1, 'iq', $2, $3, $4, $5)
-        """,
-            telegram_id,
-            score,
-            correct_answers,
-            len(QUESTIONS),
-            round(total_time, 2),
-        )
+            if not attempt:
+                return {"ok": False, "error": "Test sessiyasi topilmadi."}
 
-        await conn.execute("""
-            UPDATE users
-            SET
-                best_score = GREATEST(best_score, $2),
-                tests_taken = tests_taken + 1,
-                updated_at = NOW()
-            WHERE telegram_id = $1
-        """,
-            telegram_id,
-            score,
-        )
+            if attempt["consumed_at"] is not None:
+                return {"ok": False, "error": "Bu test allaqachon yuborilgan."}
+
+            if attempt["expires_at"] <= datetime.now(timezone.utc):
+                return {"ok": False, "error": "Test sessiyasi muddati o'tgan."}
+
+            await conn.execute("""
+                UPDATE test_attempts
+                SET consumed_at = NOW()
+                WHERE nonce = $1
+            """, token_data["nonce"])
+
+            await conn.execute("""
+                INSERT INTO users (
+                    telegram_id, username, first_name
+                )
+                VALUES ($1, $2, $3)
+                ON CONFLICT (telegram_id)
+                DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    updated_at = NOW()
+            """, telegram_id, user.get("username"), user.get("first_name", ""))
+
+            await conn.execute("""
+                INSERT INTO test_results (
+                    telegram_id, test_type, score, correct_answers,
+                    total_questions, total_time_seconds
+                )
+                VALUES ($1, 'iq', $2, $3, $4, $5)
+            """, telegram_id, score, correct_answers, len(QUESTIONS), round(total_time, 2))
+
+            await conn.execute("""
+                UPDATE users
+                SET best_score = GREATEST(best_score, $2),
+                    tests_taken = tests_taken + 1,
+                    updated_at = NOW()
+                WHERE telegram_id = $1
+            """, telegram_id, score)
 
     return {
         "ok": True,
@@ -1745,7 +1829,8 @@ async def get_me(request: Request):
                 username,
                 first_name,
                 best_score,
-                tests_taken
+                tests_taken,
+                (SELECT COUNT(*) + 1 FROM users u2 WHERE u2.tests_taken > 0 AND u2.best_score > users.best_score) AS rank
             FROM users
             WHERE telegram_id = $1
         """, telegram_id)
@@ -1759,6 +1844,7 @@ async def get_me(request: Request):
         },
         "best_score": row["best_score"] if row else 0,
         "tests_taken": row["tests_taken"] if row else 0,
+        "rank": row["rank"] if row else None,
     }
 
 
@@ -1801,7 +1887,8 @@ async def lifespan(app_instance: FastAPI):
 
     await bot.set_webhook(
         url=WEBHOOK_URL,
-        drop_pending_updates=True,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=False,
     )
 
     try:
