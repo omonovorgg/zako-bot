@@ -1814,7 +1814,4 @@ async def lifespan(app_instance: FastAPI):
             await close_db()
 
 
-app = FastAPI(
-    title="ZAKO BOT",
-    lifespan=lifespan,
-)
+app.router.lifespan_context = lifespan
