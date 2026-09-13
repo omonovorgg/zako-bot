@@ -40,12 +40,27 @@ WEBHOOK_SECRET = hmac.new(
     hashlib.sha256,
 ).hexdigest()[:64]
 
+# Bump this only when the frontend changes. The query string plus no-store
+# headers prevents Telegram WebView from keeping an old Mini App build.
+APP_VERSION = "2026.09.14.3"
+WEBAPP_URL = f"{PUBLIC_URL}/?v={urllib.parse.quote(APP_VERSION)}"
+
 MAX_INIT_DATA_AGE = 24 * 60 * 60
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 db_pool = None
 app = FastAPI()
+
+
+@app.middleware("http")
+async def no_cache_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 # ============================================================
@@ -417,7 +432,7 @@ async def start_handler(message: types.Message):
             [
                 InlineKeyboardButton(
                     text="🚀 ZAKO'NI OCHISH",
-                    web_app=WebAppInfo(url=PUBLIC_URL),
+                    web_app=WebAppInfo(url=WEBAPP_URL),
                 )
             ]
         ]
@@ -441,6 +456,7 @@ HTML = r"""
 <html lang="uz">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#090b0f">
 <title>ZAKO</title>
@@ -1298,66 +1314,99 @@ async function finishTest() {
     document.getElementById("resultText").innerText =
         "Natijang serverda tekshirilmoqda.";
 
-    try {
-        const response = await fetch("/api/test/submit", {
-            method: "POST",
-            headers: apiHeaders(),
-            body: JSON.stringify({
-                initData: tg.initData || "",
-                testToken: testToken,
-                answers: answersGiven
-            })
-        });
+    if (!testToken || answersGiven.length !== testQuestions.length) {
+        document.getElementById("resultScore").innerText = "—";
+        document.getElementById("resultLevel").innerText = "TEST XATOSI";
+        document.getElementById("resultText").innerText =
+            "Test sessiyasi to'liq shakllanmadi. Bosh sahifadan qayta boshlang.";
+        return;
+    }
 
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+    const payload = {
+        initData: tg.initData || "",
+        testToken: testToken,
+        answers: answersGiven
+    };
+
+    async function submitOnce() {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+
+        try {
+            return await fetch("/api/test/submit?v=" + encodeURIComponent("2026.09.14.3"), {
+                method: "POST",
+                headers: apiHeaders(),
+                body: JSON.stringify(payload),
+                cache: "no-store",
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    try {
+        let response;
+
+        try {
+            response = await submitOnce();
+        } catch (networkError) {
+            console.warn("First submit attempt failed, retrying once:", networkError);
+            await new Promise(resolve => setTimeout(resolve, 700));
+            response = await submitOnce();
         }
 
-        const data = await response.json();
+        const rawText = await response.text();
+        let data;
 
-        if (!data.ok) {
+        try {
+            data = JSON.parse(rawText);
+        } catch (parseError) {
+            throw new Error(`HTTP ${response.status}: server JSON qaytarmadi`);
+        }
+
+        if (!response.ok || !data.ok) {
+            const message = data.error || `HTTP ${response.status}`;
             document.getElementById("resultScore").innerText = "—";
             document.getElementById("resultLevel").innerText = "XATO";
-            document.getElementById("resultText").innerText =
-                data.error || "Natijani saqlashda xato.";
+            document.getElementById("resultText").innerText = message;
+            console.error("Submit failed:", response.status, data);
             return;
         }
 
-        const score = data.score;
+        const score = Number(data.score);
 
         localStorage.setItem("zako_score", String(score));
 
         document.getElementById("resultScore").innerText = score;
 
         if (score >= 90) {
-            document.getElementById("resultLevel").innerText =
-                "🧠 ZAKO DARAJASI";
+            document.getElementById("resultLevel").innerText = "🧠 ZAKO DARAJASI";
             document.getElementById("resultText").innerText =
-                `Juda kuchli natija. ${data.correctAnswers}/10 ta savol to'g'ri.`;
+                `Juda kuchli natija. ${data.correctAnswers}/${data.totalQuestions} ta savol to'g'ri.`;
         } else if (score >= 75) {
-            document.getElementById("resultLevel").innerText =
-                "🥇 KUCHLI";
+            document.getElementById("resultLevel").innerText = "🥇 KUCHLI";
             document.getElementById("resultText").innerText =
-                `Mantiqiy fikrlashing yaxshi. ${data.correctAnswers}/10 ta savol to'g'ri.`;
+                `Mantiqiy fikrlashing yaxshi. ${data.correctAnswers}/${data.totalQuestions} ta savol to'g'ri.`;
         } else if (score >= 55) {
-            document.getElementById("resultLevel").innerText =
-                "🥈 YAXSHI";
+            document.getElementById("resultLevel").innerText = "🥈 YAXSHI";
             document.getElementById("resultText").innerText =
-                `Yomon emas. ${data.correctAnswers}/10 ta savol to'g'ri.`;
+                `Yomon emas. ${data.correctAnswers}/${data.totalQuestions} ta savol to'g'ri.`;
         } else {
-            document.getElementById("resultLevel").innerText =
-                "🥉 BOSHLANG'ICH";
+            document.getElementById("resultLevel").innerText = "🥉 BOSHLANG'ICH";
             document.getElementById("resultText").innerText =
-                `Bu hali boshlanishi. ${data.correctAnswers}/10 ta savol to'g'ri.`;
+                `Bu hali boshlanishi. ${data.correctAnswers}/${data.totalQuestions} ta savol to'g'ri.`;
         }
 
-    } catch (error) {
-        console.error(error);
+        // Refresh profile data after a successful DB write.
+        await loadProfile();
 
+    } catch (error) {
+        console.error("Submit error:", error);
         document.getElementById("resultScore").innerText = "—";
         document.getElementById("resultLevel").innerText = "ALOQA XATOSI";
         document.getElementById("resultText").innerText =
-            "Natijani serverga yuborib bo'lmadi. Internetni tekshir.";
+            "Natijani serverga yuborishda muammo bo'ldi. Qayta urinib ko'r.";
     }
 }
 
@@ -1546,7 +1595,20 @@ loadProfile();
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(HTML)
+    return HTMLResponse(HTML, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
+
+
+@app.head("/")
+async def home_head():
+    return HTMLResponse("", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
 
 
 @app.get("/health")
