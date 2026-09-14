@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ================= ZAKO CONFIG =================
 # Only change ADMIN_IDS here. Channel is configured from /admin, not Render Environment.
-ADMIN_IDS={2109569429}  # <-- YOUR numeric Telegram ID
+ADMIN_IDS={2109569429}  # @omono_v
 BOT_USERNAME="zako_tbot"
 # ===============================================
 BOT_TOKEN=os.getenv("BOT_TOKEN","").strip()
@@ -34,13 +34,26 @@ async def db():
 async def init_db():
  p=await db()
  async with p.acquire() as c:
-  await c.execute("""CREATE TABLE IF NOT EXISTS users(tg_id BIGINT PRIMARY KEY,username TEXT,first_name TEXT,joined_at TIMESTAMPTZ DEFAULT now(),last_seen TIMESTAMPTZ DEFAULT now());
-  CREATE TABLE IF NOT EXISTS scores(id BIGSERIAL PRIMARY KEY,tg_id BIGINT REFERENCES users(tg_id),category TEXT NOT NULL,pct INT NOT NULL,created_at TIMESTAMPTZ DEFAULT now());
-  CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS challenges(token TEXT PRIMARY KEY,creator_id BIGINT REFERENCES users(tg_id),kind TEXT NOT NULL,q_ids JSONB NOT NULL,answers JSONB NOT NULL,used BOOLEAN DEFAULT false,created_at TIMESTAMPTZ DEFAULT now());""")
+  # Safe migration: preserve existing ZAKO data and normalize Telegram IDs to BIGINT.
+  users_cols={r['column_name'] for r in await c.fetch("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='users'")}
+  if not users_cols:
+   await c.execute("""CREATE TABLE users(telegram_id BIGINT PRIMARY KEY,username TEXT,first_name TEXT,joined_at TIMESTAMPTZ DEFAULT now(),last_seen TIMESTAMPTZ DEFAULT now())""")
+  else:
+   if 'telegram_id' not in users_cols and 'tg_id' in users_cols:
+    await c.execute('ALTER TABLE users RENAME COLUMN tg_id TO telegram_id')
+   await c.execute('ALTER TABLE users ALTER COLUMN telegram_id TYPE BIGINT USING telegram_id::bigint')
+   await c.execute('ALTER TABLE users ALTER COLUMN telegram_id SET NOT NULL')
+  await c.execute("""CREATE TABLE IF NOT EXISTS scores(id BIGSERIAL PRIMARY KEY,telegram_id BIGINT REFERENCES users(telegram_id),category TEXT NOT NULL,pct INT NOT NULL,created_at TIMESTAMPTZ DEFAULT now())""")
+  score_cols={r['column_name'] for r in await c.fetch("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='scores'")}
+  if 'telegram_id' not in score_cols and 'tg_id' in score_cols:
+   await c.execute('ALTER TABLE scores RENAME COLUMN tg_id TO telegram_id')
+  await c.execute('ALTER TABLE scores ALTER COLUMN telegram_id TYPE BIGINT USING telegram_id::bigint')
+  await c.execute("""CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL)""")
+  await c.execute("""CREATE TABLE IF NOT EXISTS challenges(token TEXT PRIMARY KEY,creator_id BIGINT REFERENCES users(telegram_id),kind TEXT NOT NULL,q_ids JSONB NOT NULL,answers JSONB NOT NULL,used BOOLEAN DEFAULT false,created_at TIMESTAMPTZ DEFAULT now())""")
+  await c.execute('ALTER TABLE challenges ALTER COLUMN creator_id TYPE BIGINT USING creator_id::bigint')
 async def save_user(u):
  p=await db()
- async with p.acquire() as c: await c.execute("INSERT INTO users(tg_id,username,first_name,last_seen) VALUES($1,$2,$3,now()) ON CONFLICT(tg_id) DO UPDATE SET username=EXCLUDED.username,first_name=EXCLUDED.first_name,last_seen=now()",u['id'],u.get('username'),u.get('first_name'))
+ async with p.acquire() as c: await c.execute("INSERT INTO users(telegram_id,username,first_name,last_seen) VALUES($1,$2,$3,now()) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,first_name=EXCLUDED.first_name,last_seen=now()",u['id'],u.get('username'),u.get('first_name'))
 async def get_setting(k,default=""):
  p=await db()
  async with p.acquire() as c:return await c.fetchval("SELECT v FROM settings WHERE k=$1",k) or default
@@ -125,7 +138,7 @@ async def admin_callback(a,mode):
  if mode=='user':admin_state[a]={'mode':'user_id'};return await tg('sendMessage',{'chat_id':a,'text':'👤 User Telegram ID yuboring.'})
  if mode=='all':admin_state[a]={'mode':'broadcast_prepare'};return await tg('sendMessage',{'chat_id':a,'text':'📣 Hammaga yuboriladigan xabarni yuboring. Men tasdiqlashni so‘rayman.'})
  if mode=='top':
-  async with p.acquire() as c:rows=await c.fetch("SELECT u.first_name,u.username,COALESCE(sum(s.pct),0)::int score FROM users u LEFT JOIN scores s ON s.tg_id=u.tg_id GROUP BY u.tg_id ORDER BY score DESC,u.tg_id LIMIT 10")
+  async with p.acquire() as c:rows=await c.fetch("SELECT u.first_name,u.username,COALESCE(sum(s.pct),0)::int score FROM users u LEFT JOIN scores s ON s.telegram_id=u.telegram_id GROUP BY u.telegram_id ORDER BY score DESC,u.telegram_id LIMIT 10")
   text='🏆 <b>TOP 10</b>\n\n'+''.join(f"{i}. {htmlmod.escape(r['first_name'] or r['username'] or 'ZAKO')} — <b>{r['score']}</b>\n" for i,r in enumerate(rows,1));return await tg('sendMessage',{'chat_id':a,'text':text,'parse_mode':'HTML'})
 async def admin_flow(m):
  a=m['from']['id'];st=admin_state.pop(a);mode=st.get('mode')
@@ -146,10 +159,10 @@ async def do_broadcast(a):
  st=admin_state.pop(a,None)
  if not st or st.get('mode')!='broadcast_confirm':return await tg('sendMessage',{'chat_id':a,'text':'❌ Broadcast topilmadi. Qaytadan boshlang.'})
  p=await db()
- async with p.acquire() as c:rows=await c.fetch('SELECT tg_id FROM users')
+ async with p.acquire() as c:rows=await c.fetch('SELECT telegram_id FROM users')
  ok=bad=0
  for r in rows:
-  z=await tg('copyMessage',{'chat_id':r['tg_id'],'from_chat_id':a,'message_id':st['message_id']})
+  z=await tg('copyMessage',{'chat_id':r['telegram_id'],'from_chat_id':a,'message_id':st['message_id']})
   if z.get('ok'):ok+=1
   else:bad+=1
   await asyncio.sleep(.05)
@@ -171,12 +184,12 @@ async def api_score(r:FRequest):
  await save_user(u);b=await r.json();cat=b.get('category');pct=int(b.get('pct',-1))
  if cat not in DATA['core'] or not 0<=pct<=100:raise HTTPException(400,'Noto‘g‘ri natija.')
  p=await db()
- async with p.acquire() as c: await c.execute('INSERT INTO scores(tg_id,category,pct) VALUES($1,$2,$3)',u['id'],cat,pct)
+ async with p.acquire() as c: await c.execute('INSERT INTO scores(telegram_id,category,pct) VALUES($1,$2,$3)',u['id'],cat,pct)
  return {'ok':True}
 @app.get('/api/ranking')
 async def api_rank():
  p=await db()
- async with p.acquire() as c: rows=await c.fetch("SELECT u.first_name,u.username,COALESCE(sum(s.pct),0)::int score FROM users u LEFT JOIN scores s ON s.tg_id=u.tg_id GROUP BY u.tg_id ORDER BY score DESC,u.tg_id LIMIT 50")
+ async with p.acquire() as c: rows=await c.fetch("SELECT u.first_name,u.username,COALESCE(sum(s.pct),0)::int score FROM users u LEFT JOIN scores s ON s.telegram_id=u.telegram_id GROUP BY u.telegram_id ORDER BY score DESC,u.telegram_id LIMIT 50")
  return {'rows':[{'name':r['first_name'] or r['username'] or 'ZAKO','score':r['score']} for r in rows]}
 @app.post('/api/social/create')
 async def social_create(r:FRequest):
