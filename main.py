@@ -17,6 +17,7 @@ BOT_USERNAME = "zako_tbot"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("PUBLIC_URL", "")).rstrip("/")
+pool = None  # asyncpg connection pool; initialized during FastAPI startup
 if not BOT_TOKEN or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN va DATABASE_URL Render Environment Variables'da bo‘lishi kerak.")
 if not PUBLIC_URL:
