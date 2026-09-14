@@ -387,13 +387,24 @@ async def admin_callback(uid,mode):
         period=mode.split(":",1)[1];p=await db()
         async with p.acquire() as c:await c.execute("DELETE FROM zako_rank_prizes WHERE period=$1",period)
         return await tg("sendMessage",{"chat_id":uid,"text":f"🗑 {'Haftalik' if period=='week' else 'Oylik'} sovrinlarning barchasi o‘chirildi."})
+    if mode=="grantcoins":
+        admin_state[uid]={"mode":"grant_coins_user"}
+        return await tg("sendMessage",{"chat_id":uid,"text":"🪙 <b>Coin to‘ldirish</b>\n\nUserning <b>@username</b>ini yuboring.\nMasalan: <code>@azizbek</code>","parse_mode":"HTML"})
+    if mode=="grantxp":
+        admin_state[uid]={"mode":"grant_xp_user"}
+        return await tg("sendMessage",{"chat_id":uid,"text":"⭐ <b>XP to‘ldirish</b>\n\nUserning <b>@username</b>ini yuboring.\nMasalan: <code>@azizbek</code>","parse_mode":"HTML"})
     if mode=="shop":
         p=await db()
         async with p.acquire() as c:rows=await c.fetch("SELECT id,kind,title,coins_price,xp_price,stars_price,active FROM zako_shop_items ORDER BY id")
         lines=["🛍 <b>Coin Shop boshqaruvi</b>",""]
         for x in rows:lines.append(f"#{x['id']} {'🎁' if x['kind']=='gift' else '🪙' if x['kind']=='coin_pack' else '🖼️'} {htmlmod.escape(x['title'])} — XP:{int(x['xp_price'])} / Coin:{int(x['coins_price'])} / ⭐:{int(x['stars_price'])} — {'ON' if x['active'] else 'OFF'}")
         lines += ["", "➕ Yangi sovg‘a: /addgift", "➕ Coin paketi: /addcoin", "🖼️ Yangi ramka: /addframe", "✏️ Tahrirlash: /editshop ID", "🗑 O‘chirish: /delshop ID"]
-        return await tg("sendMessage",{"chat_id":uid,"text":"\n".join(lines),"parse_mode":"HTML"})
+        kb={"inline_keyboard":[
+            [{"text":"🪙 Coin to‘ldirish","callback_data":"ad:grantcoins"},{"text":"⭐ XP to‘ldirish","callback_data":"ad:grantxp"}],
+            [{"text":"🔄 Yangilash","callback_data":"ad:shop"}],
+            [{"text":"⬅️ Admin panel","callback_data":"admin"}]
+        ]}
+        return await tg("sendMessage",{"chat_id":uid,"text":"\n".join(lines),"parse_mode":"HTML","reply_markup":kb})
     if mode=="tasks":
         p=await db()
         async with p.acquire() as c:
@@ -435,11 +446,15 @@ async def admin_flow(m):
     if uid in ADMIN_IDS and text in {"/addgift","/addcoin","/addframe"}:
         admin_state[uid]={"mode":"shop_add","kind":"gift" if text=="/addgift" else "coin_pack" if text=="/addcoin" else "frame"}
         return await tg("sendMessage",{"chat_id":uid,"text":"Yuboring: <code>Nomi|Tavsif|XP|Coin|Stars</code>\n\nGift uchun XP=0, Stars=0.\nRamka uchun XP yoki Coin narxidan birini qo‘yish mumkin.","parse_mode":"HTML"})
+    if uid in ADMIN_IDS and text == "/editshop":
+        return await tg("sendMessage",{"chat_id":uid,"text":"✏️ Format: /editshop ID"})
     if uid in ADMIN_IDS and text.startswith("/editshop "):
         try:item_id=int(text.split()[1])
         except:return await tg("sendMessage",{"chat_id":uid,"text":"❌ ID noto‘g‘ri."})
         admin_state[uid]={"mode":"shop_edit","item_id":item_id}
         return await tg("sendMessage",{"chat_id":uid,"text":"Yangi qiymat: <code>Nomi|Tavsif|XP|Coin|Stars|ON/OFF</code>","parse_mode":"HTML"})
+    if uid in ADMIN_IDS and text == "/delshop":
+        return await tg("sendMessage",{"chat_id":uid,"text":"🗑 Format: /delshop ID"})
     if uid in ADMIN_IDS and text.startswith("/delshop "):
         try:item_id=int(text.split()[1])
         except:return await tg("sendMessage",{"chat_id":uid,"text":"❌ ID noto‘g‘ri."})
@@ -448,16 +463,65 @@ async def admin_flow(m):
         return await tg("sendMessage",{"chat_id":uid,"text":"🗑 O‘chirildi." if res=="DELETE 1" else "❌ Bunday ID topilmadi."})
     if not st:return
     mode=st.get("mode")
-    if mode in {"task_add","task_edit"}:
-        parts=[x.strip() for x in text.split("|")]
-        if len(parts)!=4:
-            admin_state[uid]=st
-            return await tg("sendMessage",{"chat_id":uid,"text":"❌ Format: Nomi|@kanal|XP|Coin"})
-        title,channel,xps,coins=parts
-        try: rx=int(xps); rc=int(coins)
+    if mode in {"grant_coins_user","grant_xp_user"}:
+        username=text.strip()
+        if username.startswith("@"):
+            username=username[1:]
+        username=username.strip()
+        if not username or not re.fullmatch(r"[A-Za-z0-9_]{3,32}",username):
+            admin_state[uid]={"mode":mode}
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ Username noto‘g‘ri. Masalan: <code>@azizbek</code>","parse_mode":"HTML"})
+        p=await db()
+        async with p.acquire() as c:
+            row=await c.fetchrow("SELECT telegram_id,username,first_name FROM zako_users WHERE lower(username)=lower($1) LIMIT 1",username)
+        if not row:
+            admin_state[uid]={"mode":mode}
+            return await tg("sendMessage",{"chat_id":uid,"text":f"❌ <b>@{htmlmod.escape(username)}</b> ZAKO foydalanuvchilari orasidan topilmadi.\n\nUser botni avval ishga tushirgan va username'i ZAKO bazasida saqlangan bo‘lishi kerak.","parse_mode":"HTML"})
+        admin_state[uid]={"mode":"grant_coins_amount" if mode=="grant_coins_user" else "grant_xp_amount","target":int(row["telegram_id"]),"username":row["username"] or username}
+        label="Coin" if mode=="grant_coins_user" else "XP"
+        return await tg("sendMessage",{"chat_id":uid,"text":f"👤 <b>@{htmlmod.escape(row['username'] or username)}</b>\n\n{('🪙' if label=='Coin' else '⭐')} Qancha {label} qo‘shilsin?\nMasalan: <code>100</code>","parse_mode":"HTML"})
+
+    if mode in {"grant_coins_amount","grant_xp_amount"}:
+        try:amount=int(text)
         except:
             admin_state[uid]=st
-            return await tg("sendMessage",{"chat_id":uid,"text":"❌ XP va Coin raqam bo‘lishi kerak."})
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ Faqat musbat butun son yuboring."})
+        if amount<=0 or amount>10_000_000:
+            admin_state[uid]=st
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ Miqdor 1 dan 10 000 000 gacha bo‘lishi kerak."})
+        field="coins" if mode=="grant_coins_amount" else "xp"
+        icon="🪙" if field=="coins" else "⭐"
+        p=await db()
+        async with p.acquire() as c:
+            res=await c.execute(f"UPDATE zako_users SET {field}={field}+$2 WHERE telegram_id=$1",st["target"],amount)
+            row=await c.fetchrow("SELECT xp,coins FROM zako_users WHERE telegram_id=$1",st["target"])
+        if res!="UPDATE 1":
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ User topilmadi yoki hisob yangilanmadi."})
+        return await tg("sendMessage",{"chat_id":uid,"text":f"✅ <b>@{htmlmod.escape(st['username'])}</b> hisobiga {icon} <b>+{amount:,}</b> qo‘shildi.\n\n⭐ XP: {int(row['xp']):,}\n🪙 Coin: {int(row['coins']):,}","parse_mode":"HTML"})
+
+    if mode in {"task_add","task_edit"}:
+        parts=[x.strip() for x in text.split("|")]
+        # Qulay formatlar:
+        # 1) Nomi | @kanal | Coin   -> XP=0
+        # 2) Nomi | @kanal | XP | Coin
+        if len(parts)==3:
+            title,channel,coins=parts
+            xps="0"
+        elif len(parts)==4:
+            title,channel,xps,coins=parts
+        else:
+            admin_state[uid]=st
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ Format: Nomi | @kanal | Coin  yoki  Nomi | @kanal | XP | Coin"})
+        if not title or not channel or not channel.startswith("@"):
+            admin_state[uid]=st
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ Nom va @kanal to‘g‘ri kiritilsin."})
+        try:
+            rx=int(xps); rc=int(coins)
+            if rx < 0 or rc < 0:
+                raise ValueError
+        except:
+            admin_state[uid]=st
+            return await tg("sendMessage",{"chat_id":uid,"text":"❌ XP va Coin 0 yoki undan katta raqam bo‘lishi kerak."})
         if not title or rx<0 or rc<0:
             admin_state[uid]=st
             return await tg("sendMessage",{"chat_id":uid,"text":"❌ Ma’lumotlar noto‘g‘ri."})
@@ -572,7 +636,7 @@ async def handle_update(upd):
         if text=="/yes" and fr["id"] in ADMIN_IDS and admin_state.get(fr["id"],{}).get("mode")=="broadcast_confirm":return await do_broadcast(fr["id"])
         if text=="/cancel" and fr["id"] in ADMIN_IDS:
             admin_state.pop(fr["id"],None);return await tg("sendMessage",{"chat_id":fr["id"],"text":"❌ Bekor qilindi."})
-        if fr["id"] in ADMIN_IDS and fr["id"] in admin_state:return await admin_flow(m)
+        if fr["id"] in ADMIN_IDS:return await admin_flow(m)
         return
     if "pre_checkout_query" in upd:
         q=upd["pre_checkout_query"];payload=q.get("invoice_payload","");p=await db()
