@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ================= ZAKO CONFIG =================
 # Only change ADMIN_IDS here. Channel is configured from /admin, not Render Environment.
-ADMIN_IDS={123456789}  # <-- YOUR numeric Telegram ID
+ADMIN_IDS={2109569429}  # <-- YOUR numeric Telegram ID
 BOT_USERNAME="zako_tbot"
 # ===============================================
 BOT_TOKEN=os.getenv("BOT_TOKEN","").strip()
