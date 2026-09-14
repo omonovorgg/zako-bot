@@ -421,8 +421,10 @@ async def social_get(token:str,r:FRequest):
     p=await db()
     async with p.acquire() as c:row=await c.fetchrow("SELECT kind,q_ids,used FROM zako_challenges WHERE token=$1",token)
     if not row or row["used"]:raise HTTPException(404,"Bu test topilmadi yoki allaqachon ishlangan.")
+    raw_qids=row["q_ids"]
+    qids=json.loads(raw_qids) if isinstance(raw_qids,str) else raw_qids
     qmap={q["id"]:q for q in DATA["social"][row["kind"]]};out=[]
-    for qid in row["q_ids"]:
+    for qid in qids:
         q=qmap.get(qid)
         if not q:raise HTTPException(404,"Savol topilmadi.")
         out.append({k:q[k] for k in ("id","q","type","opts")})
@@ -441,11 +443,14 @@ async def social_finish(r:FRequest):
             if not row:raise HTTPException(404,"Test topilmadi.")
             if row["used"]:raise HTTPException(409,"Bu test allaqachon ishlangan.")
             if int(row["creator_id"])==int(u["id"]):raise HTTPException(400,"O‘z testingizni o‘zingiz ishlay olmaysiz.")
+            raw_qids=row["q_ids"]; raw_saved=row["answers"]
+            qids=json.loads(raw_qids) if isinstance(raw_qids,str) else raw_qids
+            saved=json.loads(raw_saved) if isinstance(raw_saved,str) else raw_saved
             qmap={q["id"]:q for q in DATA["social"][row["kind"]]};total=0.0
-            for i,qid in enumerate(row["q_ids"]):
+            for i,qid in enumerate(qids):
                 q=qmap.get(qid)
                 if not q:raise HTTPException(404,"Savol topilmadi.")
-                x=row["answers"][i];y=answers[i]
+                x=saved[i];y=answers[i]
                 if q["type"]=="slider":
                     if not isinstance(y,(int,float)) or not 0<=float(y)<=100:raise HTTPException(400,"Slider javobi noto‘g‘ri.")
                     total+=max(0.0,1.0-abs(float(x)-float(y))/100.0)
